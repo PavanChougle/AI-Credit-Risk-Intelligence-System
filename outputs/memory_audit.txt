@@ -1,0 +1,37 @@
+MEMORY AUDIT REPORT
+============================================================
+Total rows   : 1,303,638
+Total cols   : 29
+Total memory : 129.06 MB
+============================================================
+
+                      column    dtype  memory_MB  missing
+            emp_length_years  float64   10.42910        0
+        credit_history_years  float64   10.42910        0
+                    int_rate  float32    5.21455        0
+                 funded_amnt    int32    5.21455        0
+                   loan_amnt    int32    5.21455        0
+                         dti  float32    5.21455        0
+                 delinq_2yrs  float32    5.21455        0
+                   total_acc  float32    5.21455        0
+                  revol_util  float32    5.21455        0
+                    open_acc  float32    5.21455        0
+              inq_last_6mths  float32    5.21455        1
+                 installment  float32    5.21455        0
+                  annual_inc  float32    5.21455        0
+        pub_rec_bankruptcies  float32    5.21455        0
+                    mort_acc  float32    5.21455        0
+                     pub_rec  float32    5.21455        0
+                   revol_bal    int32    5.21455        0
+                  issue_year    Int16    3.91091        0
+               issue_quarter     Int8    2.60728        0
+                   sub_grade category    1.30399        0
+                     purpose category    1.30389        0
+              home_ownership category    1.30371        0
+                       grade category    1.30370        0
+         verification_status category    1.30370        0
+                        term     int8    1.30364        0
+pub_rec_bankruptcies_missing     int8    1.30364        0
+          revol_util_missing     int8    1.30364        0
+          emp_length_missing     int8    1.30364        0
+                      target     int8    1.30364        0

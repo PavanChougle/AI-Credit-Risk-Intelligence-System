@@ -1,0 +1,28 @@
+# Deployment Guide — Credit Risk Intelligence
+
+## System Requirements
+
+Python : 3.11+
+RAM : 4 GB minimum (8 GB recommended)
+CPU : 2+ cores
+Storage : 500 MB for model + data
+OS : Windows 10+ / Ubuntu 20.04+ / macOS 12+
+
+
+## Quick Start
+
+### Step 1 — Install dependencies
+```bash
+cd "Ai-Credit Risk intelligence system"
+python -m venv venv
+venv\Scripts\activate          # Windows
+source venv/bin/activate        # Mac/Linux
+python -m pip install -r requirements.txt
+
+python src/preprocessing.py
+python src/feature_engineering.py
+python src/training.py
+
+uvicorn api.app:app --reload --host 0.0.0.0 --port 8000
+
+curl http://localhost:8000/health

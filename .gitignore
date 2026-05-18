@@ -1,0 +1,6 @@
+data/
+*.csv
+*.parquet
+venv/
+.env
+__pycache__/
