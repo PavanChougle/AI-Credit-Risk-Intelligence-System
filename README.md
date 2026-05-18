@@ -434,7 +434,7 @@ streamlit run risk\_dashboard.py
 👤 Author
 Pavan Chougle
 
-💼 [linkedin.com/in/yourprofile](https://www.linkedin.com/in/pavan-chougle
+💼 https://www.linkedin.com/in/pavan-chougle
 🐙 https://github.com/PavanChougle
 
 Built for portfolio demonstration.
