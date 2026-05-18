@@ -429,3 +429,12 @@ python pipeline/train.py
 
 streamlit run risk\_dashboard.py
 
+👤 Author
+Pavan Chougle
+
+💼 [linkedin.com/in/yourprofile](https://www.linkedin.com/in/pavan-chougle
+🐙 https://github.com/PavanChougle
+
+Built for portfolio demonstration.
+Data: LendingClub public dataset via Kaggle.
+https://www.kaggle.com/datasets/adarshsng/lending-club-loan-data-csv
