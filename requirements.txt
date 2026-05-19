@@ -6,3 +6,5 @@ lightgbm
 plotly
 shap
 joblib
+fastapi
+uvicorn
