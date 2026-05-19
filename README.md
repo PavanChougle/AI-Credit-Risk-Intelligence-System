@@ -2,6 +2,9 @@
 
 \### LendingClub Portfolio Analysis | 1.3M+ Loans | 2012–2018
 
+# 💳 Credit Risk Intelligence System
+**[🟢 Live Dashboard]**([https://YOUR-STREAMLIT-URL.streamlit.app)](https://ai-credit-risk-intelligence-system-zg8wvqgitqgwubsnyo5pyw.streamlit.app/) | **[⚙️ Live API]**([https://YOUR-RENDER-URL.onrender.com/docs](https://ai-credit-risk-intelligence-system.onrender.com/docs)
+
 
 
 !\[Python](https://img.shields.io/badge/Python-3.10-blue)
