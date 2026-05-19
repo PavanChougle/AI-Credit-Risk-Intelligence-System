@@ -208,8 +208,8 @@ p, li, div { color: #e2e8f0; }
 # CONSTANTS
 # ============================================================
 # TODO: We will change this to the live Render URL shortly!
-API_URL   = 'https://ai-credit-risk-intelligence-system.onrender.com/'
-DATA_PATH = 'data/processed/cleaned_loans.parquet'
+API_URL   = 'https://ai-credit-risk-intelligence-system.onrender.com'
+DATA_PATH = 'data/processed/analysis_ready.parquet'
 
 TIER_COLORS = {
     'ACCEPT' : '#10b981',
