@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import warnings
-import argparse
 from pathlib import Path
 
 warnings.filterwarnings('ignore')
@@ -11,8 +10,21 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import seaborn as sns
+
 import pandas as pd
 import numpy as np
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import VarianceThreshold
+
+try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+    from sklearn.ensemble import RandomForestClassifier
 
 # --- logging ---
 logging.basicConfig(
@@ -22,429 +34,489 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- project paths (resolve relative to this file, works from any cwd) ---
-SRC_DIR      = Path(__file__).resolve().parent
-BASE_DIR     = SRC_DIR.parent
-RAW_PATH     = BASE_DIR / 'data' / 'raw' / 'loan.csv'
+# --- paths ---
+SRC_DIR       = Path(__file__).resolve().parent
+BASE_DIR      = SRC_DIR.parent
 PROCESSED_DIR = BASE_DIR / 'data' / 'processed'
-OUTPUT_DIR   = BASE_DIR / 'outputs'
-MODEL_DIR    = BASE_DIR / 'models'
+OUTPUT_DIR    = BASE_DIR / 'outputs'
 
-for _dir in [PROCESSED_DIR, OUTPUT_DIR, MODEL_DIR]:
+for _dir in [PROCESSED_DIR, OUTPUT_DIR]:
     _dir.mkdir(parents=True, exist_ok=True)
 
-# --- column lists ---
-KEEP_COLS = [
-    'loan_status', 'annual_inc', 'emp_length', 'home_ownership',
-    'verification_status', 'loan_amnt', 'funded_amnt', 'term',
-    'int_rate', 'installment', 'grade', 'sub_grade', 'purpose',
-    'dti', 'delinq_2yrs', 'fico_range_low', 'fico_range_high',
-    'inq_last_6mths', 'open_acc', 'pub_rec', 'revol_bal',
-    'revol_util', 'total_acc', 'mort_acc', 'pub_rec_bankruptcies',
-    'issue_d', 'earliest_cr_line',
-]
+# --- encoding maps ---
 
-# columns that only exist after the loan closes — using them would be leakage
-LEAKAGE_COLUMNS = [
-    'total_pymnt', 'total_pymnt_inv', 'total_rec_prncp',
-    'total_rec_int', 'total_rec_late_fee',
-    'recoveries', 'collection_recovery_fee',
-    'last_pymnt_d', 'last_pymnt_amnt', 'next_pymnt_d',
-    'last_credit_pull_d', 'out_prncp', 'out_prncp_inv',
-    'debt_settlement_flag',
-]
+# grade: A (safest) = 1, G (riskiest) = 7
+GRADE_MAP = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7}
 
-VALID_STATUSES = {'Fully Paid', 'Charged Off', 'Default'}
+# sub-grade: A1=1 through G5=35, preserves fine-grained ordering within each grade
+SUBGRADE_MAP = {
+    f"{g}{n}": (gi * 5) + n
+    for gi, g in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G'])
+    for n in range(1, 6)
+}
 
-CATEGORICAL_COLS = [
-    'grade', 'sub_grade', 'purpose',
-    'home_ownership', 'verification_status', 'loan_status',
-]
+# home ownership: higher = more stable housing situation
+HOME_OWNERSHIP_MAP = {
+    'RENT': 0, 'MORTGAGE': 1, 'OWN': 2,
+    'ANY': 1, 'OTHER': -1, 'NONE': -1,
+}
+
+# verification: higher = more verified income
+VERIFICATION_MAP = {
+    'Not Verified': 0, 'Source Verified': 1, 'Verified': 2,
+}
 
 
-def load_data(csv_path: Path) -> pd.DataFrame:
-    logger.info(f"Loading CSV: {csv_path}")
+class CreditRiskEncoder(BaseEstimator, TransformerMixin):
 
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"CSV not found at {csv_path}\n"
-            f"Place loan.csv inside data/raw/ or pass --csv <path>"
-        )
-
-    # peek at headers first so we can skip columns that don't exist
-    sample    = pd.read_csv(csv_path, nrows=5)
-    available = [c for c in KEEP_COLS if c in sample.columns]
-    skipped   = [c for c in KEEP_COLS if c not in sample.columns]
-
-    if skipped:
-        logger.warning(f"Columns not found in CSV (skipping): {skipped}")
-
-    df = pd.read_csv(csv_path, usecols=available, low_memory=False)
-
-    logger.info(
-        f"Loaded {len(df):,} rows, {len(df.columns)} columns  "
-        f"({df.memory_usage(deep=True).sum() / 1e6:.1f} MB)"
-    )
-    return df
-
-
-def clean_string_numerics(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if 'int_rate' in df.columns:
-        if df['int_rate'].dtype == object:
-            df['int_rate'] = (
-                df['int_rate'].str.replace('%', '', regex=False).str.strip().astype(float)
+    def fit(self, X: pd.DataFrame, y=None):
+        if 'purpose' in X.columns:
+            self.purpose_categories_ = (
+                X['purpose'].astype(str).value_counts().index.tolist()
             )
-            logger.info("int_rate: stripped % sign")
         else:
-            logger.info("int_rate: already numeric, skipped")
+            self.purpose_categories_ = []
+        return self
 
-    if 'revol_util' in df.columns:
-        if df['revol_util'].dtype == object:
-            df['revol_util'] = pd.to_numeric(
-                df['revol_util'].str.replace('%', '', regex=False).str.strip(),
-                errors='coerce',
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+
+        if 'grade' in X.columns:
+            X['grade_encoded'] = (
+                X['grade'].astype(str).str.upper()
+                .map(GRADE_MAP).fillna(4)
+                .astype('int8')
             )
-            logger.info("revol_util: stripped % sign")
+
+        if 'sub_grade' in X.columns:
+            X['sub_grade_encoded'] = (
+                X['sub_grade'].astype(str).str.upper()
+                .map(SUBGRADE_MAP).fillna(18)
+                .astype('int8')
+            )
+
+        if 'home_ownership' in X.columns:
+            X['home_ownership_encoded'] = (
+                X['home_ownership'].astype(str).str.upper()
+                .map(HOME_OWNERSHIP_MAP).fillna(0)
+                .astype('int8')
+            )
+
+        if 'verification_status' in X.columns:
+            X['verification_encoded'] = (
+                X['verification_status'].astype(str)
+                .map(VERIFICATION_MAP).fillna(0)
+                .astype('int8')
+            )
+
+        # one-hot encode loan purpose
+        if 'purpose' in X.columns and self.purpose_categories_:
+            for cat in self.purpose_categories_:
+                col_name = 'purpose_' + cat.replace(' ', '_').replace('/', '_').lower()
+                X[col_name] = (X['purpose'].astype(str) == cat).astype('int8')
+
+        drop_cols = [
+            'grade', 'sub_grade', 'home_ownership',
+            'verification_status', 'purpose', 'loan_status',
+        ]
+        X = X.drop(columns=[c for c in drop_cols if c in X.columns], errors='ignore')
+        return X
+
+
+class CreditFeatureEngineer(BaseEstimator, TransformerMixin):
+
+    def fit(self, X: pd.DataFrame, y=None):
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+
+        # 1. monthly payment burden — underwriting red flag above 25% of income
+        if 'installment' in X.columns and 'annual_inc' in X.columns:
+            monthly_inc = (X['annual_inc'] / 12).clip(lower=1)
+            X['payment_to_income'] = (
+                X['installment'] / monthly_inc
+            ).clip(upper=2).astype('float32')
+
+        # 2. how much of annual income the loan represents
+        if 'loan_amnt' in X.columns and 'annual_inc' in X.columns:
+            X['loan_to_annual_income'] = (
+                X['loan_amnt'] / X['annual_inc'].clip(lower=1)
+            ).clip(upper=5).astype('float32')
+
+        # 3. existing DTI + new payment burden combined
+        if 'dti' in X.columns and 'payment_to_income' in X.columns:
+            X['total_debt_burden'] = (
+                X['dti'] + X['payment_to_income'] * 100
+            ).clip(upper=200).astype('float32')
+
+        # 4. revolving utilisation above 70% is an explicit FICO red flag
+        if 'revol_util' in X.columns:
+            X['high_revol_util_flag'] = (X['revol_util'] > 70).astype('int8')
+            X['revol_util_squared']   = (X['revol_util'] ** 2).astype('float32')
+
+        # 5. composite derogatory score — weights reflect severity
+        #    delinquency x2, public record x3, bankruptcy x5
+        delinq   = X.get('delinq_2yrs',         pd.Series(0, index=X.index))
+        pub_rec  = X.get('pub_rec',              pd.Series(0, index=X.index))
+        bankrupt = X.get('pub_rec_bankruptcies', pd.Series(0, index=X.index))
+        X['derogatory_score'] = (
+            delinq.clip(upper=5).fillna(0)   * 2 +
+            pub_rec.clip(upper=3).fillna(0)  * 3 +
+            bankrupt.clip(upper=2).fillna(0) * 5
+        ).astype('float32')
+
+        # 6. long credit history + many accounts = experienced borrower
+        if 'credit_history_years' in X.columns and 'total_acc' in X.columns:
+            X['credit_depth'] = (
+                X['credit_history_years'] * X['total_acc'].clip(upper=50) / 10
+            ).astype('float32')
+
+        # 7. grade x DTI interaction — catches mispriced risk
+        #    e.g. grade B borrower with DTI 40% is riskier than their grade implies
+        if 'grade_encoded' in X.columns and 'dti' in X.columns:
+            X['grade_dti_interaction'] = (
+                X['grade_encoded'] * X['dti']
+            ).astype('float32')
+
+        # 8. DTI cliff flag — EDA showed default rates spike sharply above 30%
+        if 'dti' in X.columns:
+            X['dti_over_30_flag'] = (X['dti'] > 30).astype('int8')
+
+        # 9. log transforms for right-skewed distributions
+        if 'annual_inc' in X.columns:
+            X['log_annual_inc'] = np.log1p(X['annual_inc']).astype('float32')
+
+        if 'revol_bal' in X.columns:
+            X['log_revol_bal'] = np.log1p(X['revol_bal']).astype('float32')
+
+        # 10. grades E/F/G have meaningfully different default profiles
+        if 'grade_encoded' in X.columns:
+            X['high_risk_grade_flag'] = (X['grade_encoded'] >= 5).astype('int8')
+
+        # 11. ratio of open to total accounts — low ratio may mean many closed/defaulted
+        if 'open_acc' in X.columns and 'total_acc' in X.columns:
+            X['open_acc_ratio'] = (
+                X['open_acc'] / X['total_acc'].clip(lower=1)
+            ).clip(0, 1).astype('float32')
+
+        return X
+
+
+class FeatureSelector(BaseEstimator, TransformerMixin):
+
+    def __init__(
+        self,
+        variance_threshold:    float = 0.01,
+        correlation_threshold: float = 0.85,
+        top_n_features:        int   = 35,
+    ):
+        self.variance_threshold    = variance_threshold
+        self.correlation_threshold = correlation_threshold
+        self.top_n_features        = top_n_features
+
+    def fit(self, X: pd.DataFrame, y: pd.Series = None):
+        logger.info("Fitting feature selector (3 layers)")
+        self.all_input_features_ = X.columns.tolist()
+
+        # layer 1 — variance
+        vt = VarianceThreshold(threshold=self.variance_threshold)
+        vt.fit(X)
+        self.low_variance_features_ = X.columns[~vt.get_support()].tolist()
+        X_var = X[X.columns[vt.get_support()]]
+        logger.info(f"Layer 1 — low variance removed: {self.low_variance_features_}")
+
+        # layer 2 — correlation
+        corr   = X_var.corr().abs()
+        upper  = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        self.correlated_features_ = [
+            col for col in upper.columns
+            if any(upper[col] > self.correlation_threshold)
+        ]
+        X_corr = X_var.drop(columns=self.correlated_features_)
+        logger.info(f"Layer 2 — correlated removed: {self.correlated_features_}")
+
+        # layer 3 — model importance
+        if y is not None:
+            if LGBM_AVAILABLE:
+                model = lgb.LGBMClassifier(
+                    n_estimators=200, learning_rate=0.05,
+                    num_leaves=31, random_state=42,
+                    verbose=-1, n_jobs=-1,
+                )
+            else:
+                from sklearn.ensemble import RandomForestClassifier
+                model = RandomForestClassifier(
+                    n_estimators=100, random_state=42, n_jobs=-1
+                )
+
+            X_fit = X_corr.fillna(X_corr.median())
+            model.fit(X_fit, y)
+
+            self.importance_df_ = pd.DataFrame({
+                'feature':    X_corr.columns,
+                'importance': model.feature_importances_,
+            }).sort_values('importance', ascending=False).reset_index(drop=True)
+
+            self.selected_features_ = (
+                self.importance_df_.head(self.top_n_features)['feature'].tolist()
+            )
+            logger.info(
+                f"Layer 3 — top {self.top_n_features} features selected by importance"
+            )
         else:
-            logger.info("revol_util: already numeric, skipped")
+            self.selected_features_ = X_corr.columns.tolist()
+            self.importance_df_ = pd.DataFrame({
+                'feature':    X_corr.columns,
+                'importance': [0.0] * len(X_corr.columns),
+            })
 
-    return df
+        return self
 
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        keep = [f for f in self.selected_features_ if f in X.columns]
+        return X[keep]
 
-def remove_leakage(df: pd.DataFrame) -> pd.DataFrame:
-    found = [c for c in LEAKAGE_COLUMNS if c in df.columns]
-
-    if found:
-        df = df.drop(columns=found)
-        logger.info(f"Removed {len(found)} leakage columns: {found}")
-    else:
-        logger.info("No leakage columns found in this dataset")
-
-    return df
-
-
-def filter_loan_status(df: pd.DataFrame) -> pd.DataFrame:
-    before = len(df)
-
-    status_counts = df['loan_status'].value_counts()
-    for status, count in status_counts.items():
-        flag = 'keep' if status in VALID_STATUSES else 'drop'
-        logger.info(f"  [{flag}] {status}: {count:,}")
-
-    df = df[df['loan_status'].astype(str).isin(VALID_STATUSES)].copy()
-
-    logger.info(
-        f"Status filter: {before:,} rows -> {len(df):,} rows "
-        f"({before - len(df):,} dropped)"
-    )
-    return df
+    def log_importance_table(self, top_n: int = 20):
+        if not hasattr(self, 'importance_df_'):
+            logger.warning("Call fit() before log_importance_table()")
+            return
+        logger.info(f"Top {top_n} features by importance:")
+        for i, row in self.importance_df_.head(top_n).iterrows():
+            logger.info(f"  {i+1:>3}.  {row['feature']:<40}  {row['importance']:.1f}")
 
 
-def create_target(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df['target'] = (
-        df['loan_status'].astype(str).isin({'Charged Off', 'Default'}).astype('int8')
-    )
+def plot_feature_importance(
+    importance_df: pd.DataFrame,
+    output_path:   Path,
+    top_n:         int = 25,
+):
+    top_df = importance_df.head(top_n).copy().sort_values('importance', ascending=True)
 
-    rate = df['target'].mean()
-    logger.info(
-        f"Target created — good: {(df['target']==0).sum():,} ({1-rate:.1%})  "
-        f"default: {df['target'].sum():,} ({rate:.1%})"
-    )
-    return df
+    # colour by feature family
+    family_colors = {
+        ('grade', 'sub_grade'):                        '#e74c3c',
+        ('dti', 'debt', 'burden'):                     '#e67e22',
+        ('income', 'payment', 'loan_amnt'):            '#3498db',
+        ('revol', 'util'):                             '#9b59b6',
+        ('delinq', 'pub_rec', 'derog'):                '#c0392b',
+        ('credit_hist', 'total_acc', 'open_acc', 'depth'): '#27ae60',
+        ('int_rate', 'term', 'install'):               '#f39c12',
+    }
 
+    def get_color(name):
+        n = str(name).lower()
+        for keys, color in family_colors.items():
+            if any(k in n for k in keys):
+                return color
+        return '#95a5a6' if 'purpose' in n else '#7f8c8d'
 
-def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    colors = [get_color(f) for f in top_df['feature']]
 
-    missing_before = df.isnull().sum()
-    missing_before = missing_before[missing_before > 0]
-
-    if missing_before.empty:
-        logger.info("No missing values found")
-        return df
-
-    logger.info(f"Missing values before imputation:\n{missing_before.to_string()}")
-
-    if 'emp_length' in df.columns:
-        df['emp_length'] = df['emp_length'].fillna('Unknown')
-        df['emp_length_missing'] = df['emp_length'].isnull().astype('int8')
-
-    if 'revol_util' in df.columns:
-        df['revol_util_missing'] = df['revol_util'].isnull().astype('int8')
-        df['revol_util']         = df['revol_util'].fillna(0.0)
-
-    if 'mort_acc' in df.columns:
-        df['mort_acc'] = df['mort_acc'].fillna(0)
-
-    if 'pub_rec_bankruptcies' in df.columns:
-        median_val = df['pub_rec_bankruptcies'].median()
-        df['pub_rec_bankruptcies_missing'] = df['pub_rec_bankruptcies'].isnull().astype('int8')
-        df['pub_rec_bankruptcies']         = df['pub_rec_bankruptcies'].fillna(median_val)
-
-    if 'dti' in df.columns:
-        dti_median = df['dti'].median()
-        df['dti']  = df['dti'].fillna(dti_median)
-
-    if 'annual_inc' in df.columns:
-        before  = len(df)
-        df      = df.dropna(subset=['annual_inc'])
-        dropped = before - len(df)
-        if dropped > 0:
-            logger.info(f"annual_inc: dropped {dropped:,} rows with missing income")
-
-    remaining = df.isnull().sum()
-    remaining = remaining[remaining > 0]
-    if not remaining.empty:
-        logger.warning(f"Still missing after imputation:\n{remaining.to_string()}")
-    else:
-        logger.info("Zero missing values remaining")
-
-    return df
-
-
-def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    mem_before = df.memory_usage(deep=True).sum() / 1e6
-
-    # int64 -> int16 or int32 depending on value range
-    for col in df.select_dtypes(include=['int64']).columns:
-        col_min, col_max = df[col].min(), df[col].max()
-        if col_min >= -32_768 and col_max <= 32_767:
-            df[col] = df[col].astype('int16')
-        elif col_min >= -2_147_483_648 and col_max <= 2_147_483_647:
-            df[col] = df[col].astype('int32')
-
-    # float64 -> float32
-    for col in df.select_dtypes(include=['float64']).columns:
-        df[col] = df[col].astype('float32')
-
-    # object -> category for low-cardinality text columns
-    for col in CATEGORICAL_COLS:
-        if col in df.columns:
-            df[col] = df[col].astype('category')
-
-    mem_after = df.memory_usage(deep=True).sum() / 1e6
-    saved_pct = (1 - mem_after / mem_before) * 100
-    logger.info(
-        f"Memory: {mem_before:.1f} MB -> {mem_after:.1f} MB  "
-        f"({saved_pct:.0f}% saved)"
-    )
-    return df
-
-
-def parse_string_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if 'term' in df.columns:
-        df['term'] = (
-            df['term'].astype(str).str.strip()
-            .str.extract(r'(\d+)')[0]
-            .astype('int8')
-        )
-        logger.info(f"term parsed -> values: {sorted(df['term'].unique().tolist())}")
-
-    if 'emp_length' in df.columns:
-        s = df['emp_length'].astype(str).str.strip()
-
-        emp_numeric = pd.to_numeric(s.str.extract(r'(\d+)')[0], errors='coerce')
-        emp_numeric = emp_numeric.where(~s.str.contains('< 1', na=False), other=0)
-        emp_numeric = emp_numeric.where(
-            ~s.isin(['Unknown', 'nan', 'None', 'n/a']), other=np.nan
-        )
-
-        emp_median = emp_numeric.median()
-        df['emp_length_missing'] = emp_numeric.isnull().astype('int8')
-        df['emp_length_years']   = emp_numeric.fillna(emp_median)
-
-        logger.info(
-            f"emp_length_years created — "
-            f"unique: {sorted(df['emp_length_years'].unique().tolist())}, "
-            f"NaN filled with median ({emp_median})"
-        )
-
-    return df
-
-
-def engineer_date_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if 'issue_d' in df.columns:
-        df['issue_d'] = pd.to_datetime(df['issue_d'], format='%b-%Y', errors='coerce')
-
-    if 'earliest_cr_line' in df.columns:
-        df['earliest_cr_line'] = pd.to_datetime(
-            df['earliest_cr_line'], format='%b-%Y', errors='coerce'
-        )
-
-    if 'issue_d' in df.columns and 'earliest_cr_line' in df.columns:
-        df['credit_history_years'] = (
-            (df['issue_d'] - df['earliest_cr_line']).dt.days / 365.25
-        ).clip(lower=0)
-        logger.info(
-            f"credit_history_years — "
-            f"mean: {df['credit_history_years'].mean():.1f}, "
-            f"max: {df['credit_history_years'].max():.1f}"
-        )
-
-    if 'issue_d' in df.columns:
-        df['issue_year']    = df['issue_d'].dt.year.astype('Int16')
-        df['issue_quarter'] = df['issue_d'].dt.quarter.astype('Int8')
-        df['loan_vintage']  = (
-            df['issue_year'].astype(str) + ' Q' + df['issue_quarter'].astype(str)
-        )
-        logger.info(
-            f"issue_year range: {df['issue_year'].min()} - {df['issue_year'].max()}"
-        )
-
-    drop_dates = ['issue_d', 'earliest_cr_line']
-    df = df.drop(columns=[c for c in drop_dates if c in df.columns])
-
-    return df
-
-
-def save_outputs(df: pd.DataFrame, output_dir: Path, processed_dir: Path) -> None:
-    """Save cleaned Parquet, validation plots, and memory audit report."""
-
-    # drop columns that should not go into the model
-    drop_for_model = ['loan_status', 'emp_length', 'loan_vintage']
-    df_model = df.drop(
-        columns=[c for c in drop_for_model if c in df.columns], errors='ignore'
+    fig = plt.figure(figsize=(16, 14))
+    fig.suptitle(
+        'Feature Importance — Credit Risk Model',
+        fontsize=15, fontweight='bold', y=0.98,
     )
 
-    # save parquet
-    parquet_path = processed_dir / 'cleaned_loans.parquet'
-    df_model.to_parquet(parquet_path, index=False)
-    logger.info(
-        f"Saved {parquet_path.name} — "
-        f"{df_model.shape[0]:,} rows x {df_model.shape[1]} columns  "
-        f"({df_model.memory_usage(deep=True).sum() / 1e6:.1f} MB)"
+    ax = fig.add_axes([0.35, 0.12, 0.60, 0.80])
+    bars = ax.barh(
+        range(len(top_df)), top_df['importance'],
+        color=colors, edgecolor='white', height=0.7,
     )
+    ax.set_yticks(range(len(top_df)))
+    ax.set_yticklabels(top_df['feature'], fontsize=10)
+    ax.set_xlabel('Feature Importance Score', fontsize=11)
+    ax.set_title(f'Top {top_n} Features', fontweight='bold', fontsize=12)
 
-    # 4-panel validation chart
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Credit Risk — Phase 1 Validation', fontsize=14, fontweight='bold')
-
-    if 'target' in df_model.columns:
-        counts = df_model['target'].value_counts()
-        bars   = axes[0, 0].bar(
-            ['Fully Paid (0)', 'Default (1)'],
-            counts.values,
-            color=['steelblue', 'tomato'],
-            edgecolor='white', width=0.5,
+    max_imp = top_df['importance'].max()
+    for bar, val in zip(bars, top_df['importance']):
+        ax.text(
+            bar.get_width() + max_imp * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f'{val:.0f}', va='center', fontsize=8, color='#333',
         )
-        axes[0, 0].set_title('Target Distribution')
-        axes[0, 0].set_ylabel('Number of Loans')
-        for bar, val in zip(bars, counts.values):
-            axes[0, 0].text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() * 1.01,
-                f'{val:,}', ha='center', fontsize=10, fontweight='bold',
-            )
 
-    if 'annual_inc' in df_model.columns:
-        df_model['annual_inc'].clip(upper=250_000).hist(
-            bins=60, ax=axes[0, 1], color='coral', edgecolor='white'
-        )
-        axes[0, 1].set_title('Annual Income (clipped at $250k)')
-        axes[0, 1].set_xlabel('Annual Income ($)')
-        axes[0, 1].set_ylabel('Count')
-
-    if 'revol_util' in df_model.columns:
-        df_model['revol_util'].hist(
-            bins=60, ax=axes[1, 0], color='steelblue', edgecolor='white'
-        )
-        axes[1, 0].set_title('Revolving Utilization % (after imputation)')
-        axes[1, 0].set_xlabel('Utilization %')
-        axes[1, 0].set_ylabel('Count')
-
-    if 'credit_history_years' in df_model.columns:
-        df_model['credit_history_years'].hist(
-            bins=60, ax=axes[1, 1], color='mediumseagreen', edgecolor='white'
-        )
-        axes[1, 1].set_title('Credit History Length (years)')
-        axes[1, 1].set_xlabel('Years')
-        axes[1, 1].set_ylabel('Count')
-
-    plt.tight_layout()
-    plot_path = output_dir / 'phase1_validation.png'
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    logger.info(f"Saved {plot_path.name}")
-
-    # memory audit text report
-    memory_report = pd.DataFrame({
-        'column'   : df_model.columns,
-        'dtype'    : df_model.dtypes.values,
-        'memory_MB': (df_model.memory_usage(deep=True).values[1:] / 1e6).round(5),
-        'missing'  : df_model.isnull().sum().values,
-    }).sort_values('memory_MB', ascending=False)
-
-    audit_path = output_dir / 'memory_audit.txt'
-    with open(audit_path, 'w', encoding='utf-8') as f:
-        f.write("MEMORY AUDIT\n")
-        f.write(f"Rows    : {len(df_model):,}\n")
-        f.write(f"Columns : {len(df_model.columns)}\n")
-        f.write(
-            f"Total   : {df_model.memory_usage(deep=True).sum() / 1e6:.2f} MB\n\n"
-        )
-        f.write(memory_report.to_string(index=False))
-    logger.info(f"Saved {audit_path.name}")
-
-    # column summary to stdout
-    logger.info("Final columns in cleaned dataset:")
-    for col in sorted(df_model.columns):
-        dtype   = str(df_model[col].dtype)
-        missing = df_model[col].isnull().sum()
-        logger.info(f"  {col:<35} {dtype:<15} missing={missing:,}")
+    logger.info(f"Saved {output_path.name}")
 
 
-def run_preprocessing(
-    csv_path:   Path = RAW_PATH,
-    output_dir: Path = OUTPUT_DIR,
-    processed_dir: Path = PROCESSED_DIR,
-    save_plots: bool = True,
+def save_feature_dictionary(selected_features: list, output_path: Path):
+    
+    families = {
+        'Raw loan features':          ['loan_amnt', 'funded_amnt', 'int_rate', 'installment', 'term'],
+        'Raw borrower features':      ['annual_inc', 'dti', 'delinq_2yrs', 'inq_last_6mths',
+                                       'open_acc', 'pub_rec', 'revol_bal', 'revol_util',
+                                       'total_acc', 'mort_acc', 'pub_rec_bankruptcies',
+                                       'emp_length_years'],
+        'Time features':              ['credit_history_years', 'issue_year', 'issue_quarter'],
+        'Encoded categoricals':       ['grade_encoded', 'sub_grade_encoded',
+                                       'home_ownership_encoded', 'verification_encoded'],
+        'Engineered domain features': ['payment_to_income', 'loan_to_annual_income',
+                                       'total_debt_burden', 'high_revol_util_flag',
+                                       'revol_util_squared', 'derogatory_score',
+                                       'credit_depth', 'grade_dti_interaction',
+                                       'dti_over_30_flag', 'log_annual_inc',
+                                       'log_revol_bal', 'high_risk_grade_flag',
+                                       'open_acc_ratio'],
+        'Missing value indicators':   ['revol_util_missing', 'pub_rec_bankruptcies_missing',
+                                       'emp_length_missing'],
+        'Loan purpose (one-hot)':     [f for f in selected_features if f.startswith('purpose_')],
+        'Target variable':            ['target'],
+    }
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('# Feature dictionary — credit risk model\n\n')
+        f.write(f'**Features in final model:** {len(selected_features)}\n\n')
+        f.write('---\n\n')
+
+        for family, feature_list in families.items():
+            in_model = [feat for feat in feature_list if feat in selected_features]
+            if not in_model:
+                continue
+            f.write(f'## {family}\n\n')
+            for feat in in_model:
+                f.write(f'- `{feat}`\n')
+            f.write('\n')
+
+        # any selected features not covered by the families above
+        categorized = [feat for flist in families.values() for feat in flist]
+        uncategorized = [f for f in selected_features if f not in categorized]
+        if uncategorized:
+            f.write('## Other selected features\n\n')
+            for feat in uncategorized:
+                f.write(f'- `{feat}`\n')
+            f.write('\n')
+
+        f.write('---\n')
+        f.write('*Generated by src/feature_engineering.py*\n')
+
+    logger.info(f"Saved {output_path.name}")
+
+
+def run_feature_engineering(
+    parquet_path:  Path = PROCESSED_DIR / 'cleaned_loans.parquet',
+    output_dir:    Path = PROCESSED_DIR,
+    top_n:         int  = 35,
 ) -> pd.DataFrame:
-    """Run the full 9-step preprocessing pipeline and return the cleaned DataFrame."""
 
-    logger.info("Starting preprocessing pipeline")
+    logger.info("Starting feature engineering pipeline")
 
-    df = load_data(csv_path)
-    df = clean_string_numerics(df)
-    df = remove_leakage(df)
-    df = filter_loan_status(df)
-    df = create_target(df)
-    df = impute_missing(df)
-    df = optimize_dtypes(df)
-    df = parse_string_features(df)
-    df = engineer_date_features(df)
+    # 1. load
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"{parquet_path} not found. Run preprocessing.py first."
+        )
+    df = pd.read_parquet(parquet_path)
+    logger.info(
+        f"Loaded {df.shape[0]:,} rows x {df.shape[1]} columns  "
+        f"({df['target'].mean():.1%} default rate)"
+    )
 
-    if save_plots:
-        save_outputs(df, output_dir, processed_dir)
+    # 2. encode categoricals
+    encoder    = CreditRiskEncoder()
+    df_encoded = encoder.fit_transform(df)
+    new_cols   = [c for c in df_encoded.columns if c not in df.columns]
+    logger.info(
+        f"Encoding — columns: {df.shape[1]} -> {df_encoded.shape[1]}  "
+        f"new: {new_cols}"
+    )
+
+    # 3. engineer domain features
+    engineer    = CreditFeatureEngineer()
+    df_featured = engineer.fit_transform(df_encoded)
+    eng_cols    = [c for c in df_featured.columns if c not in df_encoded.columns]
+    logger.info(f"Engineered {len(eng_cols)} new features: {eng_cols}")
+    logger.info(f"Total columns after engineering: {df_featured.shape[1]}")
+
+    # 4. time-based train/test split (train <= 2015, test >= 2016)
+    #    random split would leak future patterns into past training
+    if 'issue_year' in df_featured.columns:
+        train_mask = df_featured['issue_year'] <= 2015
+        X_all      = df_featured.drop(columns=['target'])
+        y_all      = df_featured['target']
+        X_train    = X_all[train_mask]
+        X_test     = X_all[~train_mask]
+        y_train    = y_all[train_mask]
+        y_test     = y_all[~train_mask]
+        logger.info(
+            f"Time-based split — train (<=2015): {len(X_train):,}  "
+            f"test (2016+): {len(X_test):,}"
+        )
+    else:
+        logger.warning("issue_year not found — falling back to random 80/20 split")
+        X_all   = df_featured.drop(columns=['target'])
+        y_all   = df_featured['target']
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+        )
+
+    # keep only numeric columns, fill any remaining NaN
+    X_train = X_train.select_dtypes(include=[np.number]).fillna(X_train.median())
+    X_test  = X_test.select_dtypes(include=[np.number]).fillna(X_train.median())
+
+    # 5. feature selection (3-layer)
+    selector = FeatureSelector(
+        variance_threshold=0.01,
+        correlation_threshold=0.85,
+        top_n_features=top_n,
+    )
+    selector.fit(X_train, y_train)
+    selector.log_importance_table(top_n=20)
+
+    X_train_final = selector.transform(X_train)
+    X_test_final  = selector.transform(X_test)
+    logger.info(
+        f"Selected {X_train_final.shape[1]} features from {X_train.shape[1]}"
+    )
+
+    # 6. save outputs
+    df_train_out = X_train_final.copy()
+    df_train_out['target'] = y_train.values
+    df_train_out['split']  = 'train'
+
+    df_test_out = X_test_final.copy()
+    df_test_out['target'] = y_test.values
+    df_test_out['split']  = 'test'
+
+    df_model_ready = pd.concat(
+        [df_train_out, df_test_out], axis=0
+    ).reset_index(drop=True)
+
+    model_path = output_dir / 'model_ready_dataset.parquet'
+    df_model_ready.to_parquet(model_path, index=False)
+    logger.info(
+        f"Saved {model_path.name} — "
+        f"{df_model_ready.shape}  "
+        f"({df_model_ready.memory_usage(deep=True).sum()/1e6:.1f} MB)"
+    )
+
+    plot_feature_importance(
+        importance_df=selector.importance_df_,
+        output_path=OUTPUT_DIR / 'feature_importance_report.png',
+        top_n=25,
+    )
+
+    save_feature_dictionary(
+        selected_features=selector.selected_features_ + ['target'],
+        output_path=BASE_DIR / 'feature_dictionary.md',
+    )
 
     logger.info(
         f"Pipeline complete — "
-        f"{len(df):,} rows, {len(df.columns)} columns, "
-        f"default rate: {df['target'].mean():.1%}"
+        f"input features: {X_all.shape[1]}, "
+        f"selected: {X_train_final.shape[1]}, "
+        f"train rows: {len(X_train_final):,}, "
+        f"test rows: {len(X_test_final):,}"
     )
-    return df
+
+    return df_model_ready
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Credit risk preprocessing pipeline')
-    parser.add_argument(
-        '--csv', type=Path, default=RAW_PATH,
-        help='Path to raw loan CSV (default: data/raw/loan.csv)',
-    )
-    parser.add_argument(
-        '--no-plots', action='store_true',
-        help='Skip saving validation plots',
-    )
-    args = parser.parse_args()
-
-    df = run_preprocessing(
-        csv_path    = args.csv,
-        save_plots  = not args.no_plots,
+    df_model = run_feature_engineering(
+        parquet_path=PROCESSED_DIR / 'cleaned_loans.parquet',
+        output_dir=PROCESSED_DIR,
+        top_n=35,
     )
