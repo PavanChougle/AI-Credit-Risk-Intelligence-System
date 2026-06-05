@@ -1,9 +1,6 @@
-\# 💳 Ai Credit Risk Intelligence System
+# 💳 Ai Credit Risk Intelligence System
 
-\### LendingClub Portfolio Analysis | 1.3M+ Loans | 2012–2018
-
-# 💳 Credit Risk Intelligence System
-**[🟢 Live Dashboard]**(https://ai-credit-risk-intelligence-system-zg8wvqgitqgwubsnyo5pyw.streamlit.app/) | **[⚙️ Live API]**(https://ai-credit-risk-intelligence-system.onrender.com/docs)
+### LendingClub Portfolio Analysis | 1.3M+ Loans | 2012–2018
 
 
 
@@ -17,11 +14,11 @@
 
 
 
-\---
+---
 
 
 
-\## 🎯 Problem Statement
+## 🎯 Problem Statement
 
 
 
@@ -45,11 +42,11 @@ risk engine that quantifies default probability, segments portfolios into
 
 
 
-\---
+---
 
 
 
-\## 📊 Portfolio at a Glance
+## 📊 Portfolio at a Glance
 
 
 
@@ -69,41 +66,41 @@ risk engine that quantifies default probability, segments portfolios into
 
 
 
-\---
+---
 
 
 
-\## 💡 Key Discoveries
+## 💡 Key Discoveries
 
 
 
-\- 🔴 \*\*Grade G loans default at 50.1%\*\* — 8x higher than
+- 🔴 \*\*Grade G loans default at 50.1%\*\* — 8x higher than
 
 &#x20; Grade A (6.1%), yet share similar approval volumes
 
-\- 📈 \*\*Interest rate is the #1 predictive feature\*\* (score: 476),
+- 📈 \*\*Interest rate is the #1 predictive feature\*\* (score: 476),
 
 &#x20; followed by annual income (454) and issue year (443)
 
-\- 📉 \*\*DTI cliff at 30%\*\* — default rates jump sharply above
+- 📉 \*\*DTI cliff at 30%\*\* — default rates jump sharply above
 
 &#x20; 30% DTI, validating the threshold as a hard cutoff rule
 
-\- 💊 \*\*Loan-to-income ratio\*\* is a stronger signal than raw
+- 💊 \*\*Loan-to-income ratio\*\* is a stronger signal than raw
 
 &#x20; loan amount or income alone (engineered feature)
 
-\- ⚡ \*\*Grade × DTI interaction\*\* ranks in top 10 features,
+- ⚡ \*\*Grade × DTI interaction\*\* ranks in top 10 features,
 
 &#x20; confirming combined risk factors are non-linear
 
 
 
-\---
+---
 
 
 
-\## 🏗️ Technical Architecture
+## 🏗️ Technical Architecture
 
 
 
@@ -177,11 +174,11 @@ Live Loan Scorer
 
 
 
-\---
+---
 
 
 
-\## 📊 Model Performance
+## 📊 Model Performance
 
 
 
@@ -189,15 +186,15 @@ Live Loan Scorer
 
 |--------|:-------------------:|:--------:|
 
-| ROC-AUC | 0.6954 | \*\*0.692\*\* |
+| ROC-AUC | 0.6953 | 0.6936 |
 
-| PR-AUC | 0.350 | \*\*0.356\*\* |
+| PR-AUC | 0.3803 | 0.3887 |
 
-| Optimal Threshold | 0.47 | 0.46 |
+| Optimal Threshold | 0.505 | 0.247 |
 
 
 
-\### Confusion Matrix — Logistic Regression (Threshold = 0.47)
+### Confusion Matrix — Logistic Regression (Threshold = 0.50)
 
 
 
@@ -211,11 +208,11 @@ Live Loan Scorer
 
 
 
-\---
+---
 
 
 
-\## 🎯 Risk Tier Framework (4-Tier System)
+## 🎯 Risk Tier Framework (4-Tier System)
 
 
 
@@ -241,11 +238,11 @@ Live Loan Scorer
 
 
 
-\---
+---
 
 
 
-\## 🔍 Top Features by Importance
+## 🔍 Top Features by Importance
 
 
 
@@ -279,7 +276,7 @@ Live Loan Scorer
 
 
 
-\## 💰 Financial Impact (Basel III Framework)
+## 💰 Financial Impact (Basel III Framework)
 
 
 
@@ -307,11 +304,11 @@ Result: Measurable reduction in expected credit losses
 
 
 
-\---
+---
 
 
 
-\## 📁 Project Structure
+## 📁 Project Structure
 
 
 
@@ -325,23 +322,19 @@ credit-risk-intelligence/
 
 ├── src/
 
-│ ├── preprocessing.png        # Data cleaning pipline
+│   ├── preprocessing.py       # Data cleaning pipeline
 
-│ ├──features.py               # Feature Engineering
+│   ├── features.py            # Feature engineering
 
-│ ├── training.py              # Model training
+│   ├── training.py            # Model training + evaluation
 
-│ ├── evaluation.py            # Metrics and plots
+│   └── monitoring.py          # Drift detection
 
-│ ├── monitoring.py            # Drift detection
+├── app/
 
-├── api/
+│   ├── api.py                 # FastAPI endpoint
 
-│  └──app.py                   # FastAPI endpoint
-
-├── dashboard/
-
-│  └──app.py                   # Streamlit dashboard
+│   └── dashboard.py           # Streamlit dashboard
 
 ├── models
 
@@ -349,9 +342,9 @@ credit-risk-intelligence/
 
 ├── notebook/
 
-│   └──eda\_insight\_ipynb
+│   └──eda_insight.ipynb
 
-├── ouputs/
+├── outputs/
 
 │   ├── risk\_segments.png # borrower risk segmentation
 
@@ -379,30 +372,30 @@ credit-risk-intelligence/
 
 │   ├── threshold\_analysis.png
 
-│   └── purpose\_default\_rates.png
-├── venv                    # Lib and Scripts
-├── feature\_dictionary.md/
+│   └── purpose\_default\_rates.png      
 
-├── deployment\_guide.md/
+├── feature_dictionary.md
+
+├── deployment_guide.md/
 
 ├── README.md
-└── requirement.txt  
+└── requirements.txt  
 
 
 
 
 
-\---
+---
 
 
 
-\## 🚀 How to Run
+## 🚀 How to Run
 
 
 
-```bash
+bash
 
-\# 1. Clone repo
+# 1. Clone repo
 
 git clone https://github.com/yourname/credit-risk-intelligence
 
@@ -410,29 +403,30 @@ cd credit-risk-intelligence
 
 
 
-\# 2. Install dependencies
+# 2. Install dependencies
 
 pip install -r requirements.txt
 
 
 
-\# 3. Add data
+# 3. Add data
 
-\# Place lending\_club\_loans.csv in data/raw/
-
-
-
-\# 4. Train model
-
-python pipeline/train.py
+# Place lending\_club\_loans.csv in data/raw/
 
 
 
-\# 5. Launch dashboard
+# 4. Run the pipeline (in order)
+python src/preprocessing.py
+python src/features.py
+python src/training.py
 
-streamlit run risk\_dashboard.py
+# 5. Start the API (optional — separate terminal)
+uvicorn app.api:app --reload
 
-```
+# 6. Launch dashboard
+streamlit run app/dashboard.py
+
+---
 
 👤 Author
 Pavan Chougle
