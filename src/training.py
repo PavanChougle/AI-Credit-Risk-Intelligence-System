@@ -433,10 +433,14 @@ def save_outputs(models, test_results, features):
     best_name = max(test_results, key=lambda k: test_results[k]['auc'])
     best_model = test_results[best_name]['model']
 
-    # save model object directly — NOT wrapped in a dict
-    joblib.dump({'model': best_model, 'features': features, 'model_name': best_name},
-            MODEL_DIR / 'credit_risk_v1.pkl')
-
+    joblib.dump({
+    'model':       best_model,
+    'features':    features,
+    'threshold':   test_results[best_name]['threshold'],
+    'model_name':  best_name,
+    'test_roc_auc': test_results[best_name]['auc'],
+         }, MODEL_DIR / 'credit_risk_v1.pkl')
+    
     # save metadata separately so API can read it without loading the model
     metadata = {
         'model_name': best_name,
