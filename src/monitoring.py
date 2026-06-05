@@ -1,508 +1,522 @@
-"""
-src/monitoring.py
-=================
-Phase 5 - Model Drift Detection and Monitoring
-
-How to run:
-    python src/monitoring.py
-
-What it does:
-    - Population Stability Index (score drift)
-    - Kolmogorov-Smirnov test (feature drift)
-    - Performance degradation alerts
-    - Auto retraining trigger logic
-"""
-
-# ============================================================
-# IMPORTS
-# ============================================================
 import os
 import sys
+import logging
 import warnings
+from pathlib import Path
+
 warnings.filterwarnings('ignore')
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 import pandas as pd
 import numpy as np
-import joblib
-from datetime import datetime
-from scipy import stats
-from sklearn.metrics import roc_auc_score, average_precision_score
 
-os.makedirs('outputs',  exist_ok=True)
-os.makedirs('models',   exist_ok=True)
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import VarianceThreshold
 
-# ============================================================
-# PSI + KS MONITOR
-# ============================================================
-class CreditModelMonitor:
-    """
-    Monitors deployed credit risk model for degradation.
+try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+    from sklearn.ensemble import RandomForestClassifier
 
-    Three monitoring layers:
-    1. Score PSI      - did predicted probabilities shift?
-    2. Feature KS     - did input distributions shift?
-    3. Performance    - did AUC / default rate change?
+# --- logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s  %(levelname)s  %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger(__name__)
 
-    PSI thresholds (industry standard):
-        < 0.10  GREEN  - No action needed
-        0.10-0.25 YELLOW - Monitor closely
-        > 0.25  RED    - Retrain immediately
-    """
+# --- paths ---
+SRC_DIR       = Path(__file__).resolve().parent
+BASE_DIR      = SRC_DIR.parent
+PROCESSED_DIR = BASE_DIR / 'data' / 'processed'
+OUTPUT_DIR    = BASE_DIR / 'outputs'
 
-    def __init__(
-        self,
-        reference_scores  : np.ndarray,
-        reference_features: pd.DataFrame,
-        model_name        : str = 'credit_risk_v1',
-    ):
-        self.reference_scores   = np.array(reference_scores)
-        self.reference_features = reference_features.copy()
-        self.model_name         = model_name
-        self.alert_log          = []
-        self.check_timestamp    = datetime.now().isoformat()
+for _dir in [PROCESSED_DIR, OUTPUT_DIR]:
+    _dir.mkdir(parents=True, exist_ok=True)
 
-    # ── PSI ───────────────────────────────────────────────────
-    def population_stability_index(
-        self,
-        current_scores: np.ndarray,
-        n_bins        : int = 10,
-        verbose       : bool = True,
-    ) -> float:
-        """
-        Measure how much the score distribution has shifted.
+# --- encoding maps ---
 
-        Formula:
-        PSI = sum((Current% - Reference%) * ln(Current% / Reference%))
+# grade: A (safest) = 1, G (riskiest) = 7
+GRADE_MAP = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7}
 
-        Args:
-            current_scores: predicted probabilities from new data
-            n_bins: number of buckets (10 is standard)
+# sub-grade: A1=1 through G5=35, preserves fine-grained ordering within each grade
+SUBGRADE_MAP = {
+    f"{g}{n}": (gi * 5) + n
+    for gi, g in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G'])
+    for n in range(1, 6)
+}
 
-        Returns:
-            PSI value (float)
-        """
-        current_scores = np.array(current_scores)
+# home ownership: higher = more stable housing situation
+HOME_OWNERSHIP_MAP = {
+    'RENT': 0, 'MORTGAGE': 1, 'OWN': 2,
+    'ANY': 1, 'OTHER': -1, 'NONE': -1,
+}
 
-        # Create bins from reference distribution
-        bins       = np.percentile(self.reference_scores, np.linspace(0, 100, n_bins + 1))
-        bins[0]    = -0.001
-        bins[-1]   = 1.001
-        bins       = np.unique(bins)  # remove duplicates
-
-        ref_counts, _ = np.histogram(self.reference_scores, bins=bins)
-        cur_counts, _ = np.histogram(current_scores, bins=bins)
-
-        # Convert to percentages (avoid div by zero)
-        ref_pct = ref_counts / len(self.reference_scores) + 1e-10
-        cur_pct = cur_counts / len(current_scores)        + 1e-10
-
-        psi = float(np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct)))
-
-        # Classify
-        if psi < 0.10:
-            status = 'STABLE'
-            color  = 'GREEN'
-        elif psi < 0.25:
-            status = 'MONITOR'
-            color  = 'YELLOW'
-        else:
-            status = 'RETRAIN'
-            color  = 'RED'
-
-        if verbose:
-            print(f'  PSI Score   : {psi:.4f}')
-            print(f'  Status      : [{color}] {status}')
-            if status == 'RETRAIN':
-                self.alert_log.append({
-                    'type'     : 'PSI_ALERT',
-                    'value'    : psi,
-                    'status'   : status,
-                    'timestamp': self.check_timestamp,
-                })
-
-        return psi
-
-    # ── KS Feature Drift ──────────────────────────────────────
-    def feature_drift_report(
-        self,
-        current_features  : pd.DataFrame,
-        significance_level: float = 0.01,
-        top_n             : int   = 20,
-    ) -> pd.DataFrame:
-        """
-        Run Kolmogorov-Smirnov test on each numeric feature.
-
-        KS test compares two distributions without assuming normality.
-        p_value < 0.01 means the distributions are significantly different.
-
-        Args:
-            current_features: new data features
-            significance_level: p-value threshold for drift detection
-            top_n: show top N drifted features
-
-        Returns:
-            DataFrame with KS stats per feature
-        """
-        results = []
-
-        numeric_cols = self.reference_features.select_dtypes(
-            include=[np.number]
-        ).columns
-
-        for col in numeric_cols:
-            if col not in current_features.columns:
-                continue
-
-            ref_vals = self.reference_features[col].dropna().values
-            cur_vals = current_features[col].dropna().values
-
-            if len(ref_vals) == 0 or len(cur_vals) == 0:
-                continue
-
-            ks_stat, p_value = stats.ks_2samp(ref_vals, cur_vals)
-
-            results.append({
-                'feature'        : col,
-                'ks_statistic'   : round(float(ks_stat), 4),
-                'p_value'        : round(float(p_value), 6),
-                'drift_detected' : bool(p_value < significance_level),
-                'ref_mean'       : round(float(ref_vals.mean()), 4),
-                'cur_mean'       : round(float(cur_vals.mean()), 4),
-                'mean_shift_pct' : round(
-                    float((cur_vals.mean() - ref_vals.mean()) /
-                    (abs(ref_vals.mean()) + 1e-10) * 100), 1
-                ),
-            })
-
-        df_results = (
-            pd.DataFrame(results)
-            .sort_values('ks_statistic', ascending=False)
-            .reset_index(drop=True)
-        )
-
-        n_drifted = df_results['drift_detected'].sum()
-        print(f'\n  Feature Drift Report (KS Test, p<{significance_level}):')
-        print(f'  Drifted features: {n_drifted} / {len(df_results)}')
-        print(f'\n  {"Feature":<35} {"KS":>6} {"p-val":>10} {"Drift":>7} {"Ref Mean":>10} {"Cur Mean":>10} {"Shift%":>8}')
-        print(f'  {"-"*35} {"-"*6} {"-"*10} {"-"*7} {"-"*10} {"-"*10} {"-"*8}')
-
-        for _, row in df_results.head(top_n).iterrows():
-            drift_flag = 'DRIFT' if row['drift_detected'] else 'ok'
-            print(
-                f'  {row["feature"]:<35} '
-                f'{row["ks_statistic"]:>6.4f} '
-                f'{row["p_value"]:>10.6f} '
-                f'{drift_flag:>7} '
-                f'{row["ref_mean"]:>10.2f} '
-                f'{row["cur_mean"]:>10.2f} '
-                f'{row["mean_shift_pct"]:>7.1f}%'
-            )
-
-        if n_drifted > 5:
-            self.alert_log.append({
-                'type'      : 'FEATURE_DRIFT_ALERT',
-                'n_drifted' : int(n_drifted),
-                'timestamp' : self.check_timestamp,
-            })
-
-        return df_results
-
-    # ── Performance Check ─────────────────────────────────────
-    def performance_check(
-        self,
-        y_true       : pd.Series,
-        y_prob       : np.ndarray,
-        auc_threshold: float = 0.68,
-    ) -> dict:
-        """
-        Evaluate model performance on recent labeled data.
-        Labels are only available 90+ days after loan origination.
-
-        Args:
-            y_true: actual outcomes (0/1)
-            y_prob: model predicted probabilities
-            auc_threshold: minimum acceptable AUC before alert
-
-        Returns:
-            dict with roc_auc, pr_auc, and alert status
-        """
-        auc    = float(roc_auc_score(y_true, y_prob))
-        prauc  = float(average_precision_score(y_true, y_prob))
-        dr     = float(y_true.mean())
-
-        status = 'OK'
-        if auc < auc_threshold:
-            status = 'ALERT: RETRAIN REQUIRED'
-            self.alert_log.append({
-                'type'     : 'PERFORMANCE_DEGRADATION',
-                'roc_auc'  : auc,
-                'threshold': auc_threshold,
-                'timestamp': self.check_timestamp,
-            })
-
-        print(f'\n  Performance Check:')
-        print(f'  ROC-AUC      : {auc:.4f}  (threshold: {auc_threshold:.2f})')
-        print(f'  PR-AUC       : {prauc:.4f}')
-        print(f'  Default Rate : {dr:.1%}')
-        print(f'  Status       : {status}')
-
-        return {
-            'roc_auc'     : round(auc, 4),
-            'pr_auc'      : round(prauc, 4),
-            'default_rate': round(dr, 4),
-            'status'      : status,
-            'timestamp'   : self.check_timestamp,
-        }
-
-    # ── Plot Drift Dashboard ──────────────────────────────────
-    def plot_drift_dashboard(
-        self,
-        current_scores  : np.ndarray,
-        current_features: pd.DataFrame,
-        drift_report    : pd.DataFrame,
-        output_path     : str = 'outputs/drift_dashboard.png',
-    ) -> None:
-        """Generate monitoring dashboard chart."""
-        current_scores = np.array(current_scores)
-        fig, axes      = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(
-            f'Model Monitoring Dashboard — {self.model_name}\n'
-            f'Checked: {self.check_timestamp[:10]}',
-            fontsize=13, fontweight='bold'
-        )
-
-        # Plot 1: Score distribution comparison
-        axes[0,0].hist(
-            self.reference_scores, bins=40,
-            alpha=0.6, color='steelblue',
-            label='Reference (train)', density=True
-        )
-        axes[0,0].hist(
-            current_scores, bins=40,
-            alpha=0.6, color='tomato',
-            label='Current (new)', density=True
-        )
-        axes[0,0].set_title('Score Distribution Shift', fontweight='bold')
-        axes[0,0].set_xlabel('Predicted Default Probability')
-        axes[0,0].set_ylabel('Density')
-        axes[0,0].legend()
-        axes[0,0].grid(True, alpha=0.3)
-
-        # Plot 2: KS statistic bar chart
-        if len(drift_report) > 0:
-            top_drift = drift_report.head(15).sort_values('ks_statistic')
-            bar_colors = [
-                '#e74c3c' if d else '#2ecc71'
-                for d in top_drift['drift_detected']
-            ]
-            axes[0,1].barh(
-                top_drift['feature'],
-                top_drift['ks_statistic'],
-                color=bar_colors, edgecolor='white'
-            )
-            axes[0,1].axvline(0.1, color='orange', linestyle='--', label='KS=0.10')
-            axes[0,1].set_title(
-                'Feature Drift (KS Statistic)\nRed=Drifted | Green=Stable',
-                fontweight='bold'
-            )
-            axes[0,1].set_xlabel('KS Statistic')
-            axes[0,1].legend(fontsize=8)
-
-        # Plot 3: Feature distribution for most drifted feature
-        if len(drift_report) > 0:
-            top_feat = drift_report.iloc[0]['feature']
-            if top_feat in current_features.columns:
-                ref_vals = self.reference_features[top_feat].dropna()
-                cur_vals = current_features[top_feat].dropna()
-                axes[1,0].hist(
-                    ref_vals.clip(
-                        ref_vals.quantile(0.01),
-                        ref_vals.quantile(0.99)
-                    ),
-                    bins=40, alpha=0.6, color='steelblue',
-                    label='Reference', density=True
-                )
-                axes[1,0].hist(
-                    cur_vals.clip(
-                        cur_vals.quantile(0.01),
-                        cur_vals.quantile(0.99)
-                    ),
-                    bins=40, alpha=0.6, color='tomato',
-                    label='Current', density=True
-                )
-                axes[1,0].set_title(
-                    f'Most Drifted Feature: {top_feat}',
-                    fontweight='bold'
-                )
-                axes[1,0].legend()
-                axes[1,0].grid(True, alpha=0.3)
-
-        # Plot 4: Alert log summary
-        if self.alert_log:
-            alert_types = [a['type'] for a in self.alert_log]
-            unique, counts = np.unique(alert_types, return_counts=True)
-            colors = ['#e74c3c', '#f39c12', '#e67e22'][:len(unique)]
-            axes[1,1].bar(unique, counts, color=colors, edgecolor='white')
-            axes[1,1].set_title('Active Alerts', fontweight='bold')
-            axes[1,1].set_ylabel('Count')
-            axes[1,1].tick_params(axis='x', rotation=15)
-        else:
-            axes[1,1].text(
-                0.5, 0.5, 'No Alerts\nModel Stable',
-                ha='center', va='center',
-                fontsize=16, color='green', fontweight='bold',
-                transform=axes[1,1].transAxes
-            )
-            axes[1,1].set_title('Alert Status', fontweight='bold')
-
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f'  [SAVED] {output_path}')
-
-    # ── Print Alert Summary ───────────────────────────────────
-    def print_alert_summary(self) -> None:
-        """Print all active alerts."""
-        print(f'\n  ALERT SUMMARY ({len(self.alert_log)} alerts):')
-        print('  ' + '=' * 50)
-        if not self.alert_log:
-            print('  [GREEN] No alerts. Model is stable.')
-        for alert in self.alert_log:
-            print(f'  [RED] {alert["type"]}')
-            for k, v in alert.items():
-                if k != 'type':
-                    print(f'        {k}: {v}')
-
-    # ── Retraining Decision ───────────────────────────────────
-    def should_retrain(self) -> bool:
-        """Return True if any critical alert was triggered."""
-        critical = ['PSI_ALERT', 'PERFORMANCE_DEGRADATION']
-        for alert in self.alert_log:
-            if alert['type'] in critical:
-                return True
-        return False
-
-
-# ============================================================
-# RETRAINING TRIGGERS
-# ============================================================
-RETRAINING_TRIGGERS = {
-    'PSI > 0.25'              : 'Score distribution shifted significantly',
-    'ROC-AUC < 0.68'         : 'Model discrimination power degraded',
-    'Top-5 feature drift'     : 'Critical predictor distributions changed',
-    'Default rate deviation>3%': 'Actuals diverging from predictions',
-    'Quarterly calendar'      : 'Mandatory retraining every 90 days',
+# verification: higher = more verified income
+VERIFICATION_MAP = {
+    'Not Verified': 0, 'Source Verified': 1, 'Verified': 2,
 }
 
 
-# ============================================================
-# MAIN — Demo run with synthetic data
-# ============================================================
-def run_monitoring_demo(
-    model_path  : str = 'models/credit_risk_v1.pkl',
-    data_path   : str = 'data/processed/model_ready_dataset.parquet',
-) -> None:
-    """
-    Demonstrate monitoring with reference vs simulated new data.
-    In production replace simulated data with real new loan applications.
-    """
-    print('=' * 60)
-    print('  CREDIT RISK — MODEL MONITORING')
-    print('=' * 60)
+class CreditRiskEncoder(BaseEstimator, TransformerMixin):
 
-    # Load model
-    if not os.path.exists(model_path):
-        print(f'[ERROR] Model not found: {model_path}')
-        print('  Run python src/training.py first')
-        return
+    def fit(self, X: pd.DataFrame, y=None):
+        if 'purpose' in X.columns:
+            self.purpose_categories_ = (
+                X['purpose'].astype(str).value_counts().index.tolist()
+            )
+        else:
+            self.purpose_categories_ = []
+        return self
 
-    artifact = joblib.load(model_path)
-    model    = artifact['model']
-    features = artifact['feature_names']
-    print(f'\n[OK] Model loaded: {artifact["model_name"]}')
-    print(f'[OK] Saved AUC   : {artifact["test_roc_auc"]:.4f}')
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
 
-    # Load reference data
-    if not os.path.exists(data_path):
-        print(f'[ERROR] Data not found: {data_path}')
-        return
+        if 'grade' in X.columns:
+            X['grade_encoded'] = (
+                X['grade'].astype(str).str.upper()
+                .map(GRADE_MAP).fillna(4)
+                .astype('int8')
+            )
 
-    df = pd.read_parquet(data_path)
-    print(f'[OK] Data loaded : {df.shape}')
+        if 'sub_grade' in X.columns:
+            X['sub_grade_encoded'] = (
+                X['sub_grade'].astype(str).str.upper()
+                .map(SUBGRADE_MAP).fillna(18)
+                .astype('int8')
+            )
 
-    # Use training data as reference
-    drop_cols = ['target', 'split', 'issue_year']
-    feat_cols = [c for c in features if c in df.columns]
+        if 'home_ownership' in X.columns:
+            X['home_ownership_encoded'] = (
+                X['home_ownership'].astype(str).str.upper()
+                .map(HOME_OWNERSHIP_MAP).fillna(0)
+                .astype('int8')
+            )
 
-    if 'issue_year' in df.columns:
-        ref_mask = df['issue_year'] <= 2015
-        cur_mask = df['issue_year'] >= 2017
-    else:
-        mid      = len(df) // 2
-        ref_mask = pd.Series([True]*mid  + [False]*(len(df)-mid), index=df.index)
-        cur_mask = pd.Series([False]*mid + [True]*(len(df)-mid),  index=df.index)
+        if 'verification_status' in X.columns:
+            X['verification_encoded'] = (
+                X['verification_status'].astype(str)
+                .map(VERIFICATION_MAP).fillna(0)
+                .astype('int8')
+            )
 
-    df_ref = df[ref_mask][feat_cols].fillna(0)
-    df_cur = df[cur_mask][feat_cols].fillna(0)
-    y_cur  = df[cur_mask]['target']
+        # one-hot encode loan purpose
+        if 'purpose' in X.columns and self.purpose_categories_:
+            for cat in self.purpose_categories_:
+                col_name = 'purpose_' + cat.replace(' ', '_').replace('/', '_').lower()
+                X[col_name] = (X['purpose'].astype(str) == cat).astype('int8')
 
-    # Predict scores
-    ref_scores = model.predict_proba(df_ref)[:, 1]
-    cur_scores = model.predict_proba(df_cur)[:, 1]
+        drop_cols = [
+            'grade', 'sub_grade', 'home_ownership',
+            'verification_status', 'purpose', 'loan_status',
+        ]
+        X = X.drop(columns=[c for c in drop_cols if c in X.columns], errors='ignore')
+        return X
 
-    print(f'\n  Reference data : {len(df_ref):,} loans')
-    print(f'  Current data   : {len(df_cur):,} loans')
 
-    # ── Initialize monitor ────────────────────────────────────
-    monitor = CreditModelMonitor(
-        reference_scores   = ref_scores,
-        reference_features = df_ref,
-        model_name         = artifact['model_name'],
+class CreditFeatureEngineer(BaseEstimator, TransformerMixin):
+
+    def fit(self, X: pd.DataFrame, y=None):
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+
+        # 1. monthly payment burden — underwriting red flag above 25% of income
+        if 'installment' in X.columns and 'annual_inc' in X.columns:
+            monthly_inc = (X['annual_inc'] / 12).clip(lower=1)
+            X['payment_to_income'] = (
+                X['installment'] / monthly_inc
+            ).clip(upper=2).astype('float32')
+
+        # 2. how much of annual income the loan represents
+        if 'loan_amnt' in X.columns and 'annual_inc' in X.columns:
+            X['loan_to_annual_income'] = (
+                X['loan_amnt'] / X['annual_inc'].clip(lower=1)
+            ).clip(upper=5).astype('float32')
+
+        # 3. existing DTI + new payment burden combined
+        if 'dti' in X.columns and 'payment_to_income' in X.columns:
+            X['total_debt_burden'] = (
+                X['dti'] + X['payment_to_income'] * 100
+            ).clip(upper=200).astype('float32')
+
+        # 4. revolving utilisation above 70% is an explicit FICO red flag
+        if 'revol_util' in X.columns:
+            X['high_revol_util_flag'] = (X['revol_util'] > 70).astype('int8')
+            X['revol_util_squared']   = (X['revol_util'] ** 2).astype('float32')
+
+        # 5. composite derogatory score — weights reflect severity
+        #    delinquency x2, public record x3, bankruptcy x5
+        delinq   = X.get('delinq_2yrs',         pd.Series(0, index=X.index))
+        pub_rec  = X.get('pub_rec',              pd.Series(0, index=X.index))
+        bankrupt = X.get('pub_rec_bankruptcies', pd.Series(0, index=X.index))
+        X['derogatory_score'] = (
+            delinq.clip(upper=5).fillna(0)   * 2 +
+            pub_rec.clip(upper=3).fillna(0)  * 3 +
+            bankrupt.clip(upper=2).fillna(0) * 5
+        ).astype('float32')
+
+        # 6. long credit history + many accounts = experienced borrower
+        if 'credit_history_years' in X.columns and 'total_acc' in X.columns:
+            X['credit_depth'] = (
+                X['credit_history_years'] * X['total_acc'].clip(upper=50) / 10
+            ).astype('float32')
+
+        # 7. grade x DTI interaction — catches mispriced risk
+        #    e.g. grade B borrower with DTI 40% is riskier than their grade implies
+        if 'grade_encoded' in X.columns and 'dti' in X.columns:
+            X['grade_dti_interaction'] = (
+                X['grade_encoded'] * X['dti']
+            ).astype('float32')
+
+        # 8. DTI cliff flag — EDA showed default rates spike sharply above 30%
+        if 'dti' in X.columns:
+            X['dti_over_30_flag'] = (X['dti'] > 30).astype('int8')
+
+        # 9. log transforms for right-skewed distributions
+        if 'annual_inc' in X.columns:
+            X['log_annual_inc'] = np.log1p(X['annual_inc']).astype('float32')
+
+        if 'revol_bal' in X.columns:
+            X['log_revol_bal'] = np.log1p(X['revol_bal']).astype('float32')
+
+        # 10. grades E/F/G have meaningfully different default profiles
+        if 'grade_encoded' in X.columns:
+            X['high_risk_grade_flag'] = (X['grade_encoded'] >= 5).astype('int8')
+
+        # 11. ratio of open to total accounts — low ratio may mean many closed/defaulted
+        if 'open_acc' in X.columns and 'total_acc' in X.columns:
+            X['open_acc_ratio'] = (
+                X['open_acc'] / X['total_acc'].clip(lower=1)
+            ).clip(0, 1).astype('float32')
+
+        return X
+
+
+class FeatureSelector(BaseEstimator, TransformerMixin):
+
+    def __init__(
+        self,
+        variance_threshold:    float = 0.01,
+        correlation_threshold: float = 0.85,
+        top_n_features:        int   = 35,
+    ):
+        self.variance_threshold    = variance_threshold
+        self.correlation_threshold = correlation_threshold
+        self.top_n_features        = top_n_features
+
+    def fit(self, X: pd.DataFrame, y: pd.Series = None):
+        logger.info("Fitting feature selector (3 layers)")
+        self.all_input_features_ = X.columns.tolist()
+
+        # layer 1 — variance
+        vt = VarianceThreshold(threshold=self.variance_threshold)
+        vt.fit(X)
+        self.low_variance_features_ = X.columns[~vt.get_support()].tolist()
+        X_var = X[X.columns[vt.get_support()]]
+        logger.info(f"Layer 1 — low variance removed: {self.low_variance_features_}")
+
+        # layer 2 — correlation
+        corr   = X_var.corr().abs()
+        upper  = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        self.correlated_features_ = [
+            col for col in upper.columns
+            if any(upper[col] > self.correlation_threshold)
+        ]
+        X_corr = X_var.drop(columns=self.correlated_features_)
+        logger.info(f"Layer 2 — correlated removed: {self.correlated_features_}")
+
+        # layer 3 — model importance
+        if y is not None:
+            if LGBM_AVAILABLE:
+                model = lgb.LGBMClassifier(
+                    n_estimators=200, learning_rate=0.05,
+                    num_leaves=31, random_state=42,
+                    verbose=-1, n_jobs=-1,
+                )
+            else:
+                from sklearn.ensemble import RandomForestClassifier
+                model = RandomForestClassifier(
+                    n_estimators=100, random_state=42, n_jobs=-1
+                )
+
+            X_fit = X_corr.fillna(X_corr.median())
+            model.fit(X_fit, y)
+
+            self.importance_df_ = pd.DataFrame({
+                'feature':    X_corr.columns,
+                'importance': model.feature_importances_,
+            }).sort_values('importance', ascending=False).reset_index(drop=True)
+
+            self.selected_features_ = (
+                self.importance_df_.head(self.top_n_features)['feature'].tolist()
+            )
+            logger.info(
+                f"Layer 3 — top {self.top_n_features} features selected by importance"
+            )
+        else:
+            self.selected_features_ = X_corr.columns.tolist()
+            self.importance_df_ = pd.DataFrame({
+                'feature':    X_corr.columns,
+                'importance': [0.0] * len(X_corr.columns),
+            })
+
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        keep = [f for f in self.selected_features_ if f in X.columns]
+        return X[keep]
+
+    def log_importance_table(self, top_n: int = 20):
+        if not hasattr(self, 'importance_df_'):
+            logger.warning("Call fit() before log_importance_table()")
+            return
+        logger.info(f"Top {top_n} features by importance:")
+        for i, row in self.importance_df_.head(top_n).iterrows():
+            logger.info(f"  {i+1:>3}.  {row['feature']:<40}  {row['importance']:.1f}")
+
+
+def plot_feature_importance(
+    importance_df: pd.DataFrame,
+    output_path:   Path,
+    top_n:         int = 25,
+):
+    top_df = importance_df.head(top_n).copy().sort_values('importance', ascending=True)
+
+    # colour by feature family
+    family_colors = {
+        ('grade', 'sub_grade'):                        '#e74c3c',
+        ('dti', 'debt', 'burden'):                     '#e67e22',
+        ('income', 'payment', 'loan_amnt'):            '#3498db',
+        ('revol', 'util'):                             '#9b59b6',
+        ('delinq', 'pub_rec', 'derog'):                '#c0392b',
+        ('credit_hist', 'total_acc', 'open_acc', 'depth'): '#27ae60',
+        ('int_rate', 'term', 'install'):               '#f39c12',
+    }
+
+    def get_color(name):
+        n = str(name).lower()
+        for keys, color in family_colors.items():
+            if any(k in n for k in keys):
+                return color
+        return '#95a5a6' if 'purpose' in n else '#7f8c8d'
+
+    colors = [get_color(f) for f in top_df['feature']]
+
+    fig = plt.figure(figsize=(16, 14))
+    fig.suptitle(
+        'Feature Importance — Credit Risk Model',
+        fontsize=15, fontweight='bold', y=0.98,
     )
 
-    # ── Run checks ────────────────────────────────────────────
-    print('\n[CHECK 1] Population Stability Index (PSI):')
-    psi = monitor.population_stability_index(cur_scores)
+    ax = fig.add_axes([0.35, 0.12, 0.60, 0.80])
+    bars = ax.barh(
+        range(len(top_df)), top_df['importance'],
+        color=colors, edgecolor='white', height=0.7,
+    )
+    ax.set_yticks(range(len(top_df)))
+    ax.set_yticklabels(top_df['feature'], fontsize=10)
+    ax.set_xlabel('Feature Importance Score', fontsize=11)
+    ax.set_title(f'Top {top_n} Features', fontweight='bold', fontsize=12)
 
-    print('\n[CHECK 2] Feature Drift (KS Test):')
-    drift_report = monitor.feature_drift_report(df_cur)
+    max_imp = top_df['importance'].max()
+    for bar, val in zip(bars, top_df['importance']):
+        ax.text(
+            bar.get_width() + max_imp * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f'{val:.0f}', va='center', fontsize=8, color='#333',
+        )
 
-    print('\n[CHECK 3] Performance Check:')
-    perf = monitor.performance_check(y_cur, cur_scores)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved {output_path.name}")
 
-    # ── Plot dashboard ────────────────────────────────────────
-    print('\n[PLOT] Generating monitoring dashboard...')
-    monitor.plot_drift_dashboard(
-        current_scores   = cur_scores,
-        current_features = df_cur,
-        drift_report     = drift_report,
-        output_path      = 'outputs/drift_dashboard.png',
+
+def save_feature_dictionary(selected_features: list, output_path: Path):
+    
+    families = {
+        'Raw loan features':          ['loan_amnt', 'funded_amnt', 'int_rate', 'installment', 'term'],
+        'Raw borrower features':      ['annual_inc', 'dti', 'delinq_2yrs', 'inq_last_6mths',
+                                       'open_acc', 'pub_rec', 'revol_bal', 'revol_util',
+                                       'total_acc', 'mort_acc', 'pub_rec_bankruptcies',
+                                       'emp_length_years'],
+        'Time features':              ['credit_history_years', 'issue_year', 'issue_quarter'],
+        'Encoded categoricals':       ['grade_encoded', 'sub_grade_encoded',
+                                       'home_ownership_encoded', 'verification_encoded'],
+        'Engineered domain features': ['payment_to_income', 'loan_to_annual_income',
+                                       'total_debt_burden', 'high_revol_util_flag',
+                                       'revol_util_squared', 'derogatory_score',
+                                       'credit_depth', 'grade_dti_interaction',
+                                       'dti_over_30_flag', 'log_annual_inc',
+                                       'log_revol_bal', 'high_risk_grade_flag',
+                                       'open_acc_ratio'],
+        'Missing value indicators':   ['revol_util_missing', 'pub_rec_bankruptcies_missing',
+                                       'emp_length_missing'],
+        'Loan purpose (one-hot)':     [f for f in selected_features if f.startswith('purpose_')],
+        'Target variable':            ['target'],
+    }
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('# Feature dictionary — credit risk model\n\n')
+        f.write(f'**Features in final model:** {len(selected_features)}\n\n')
+        f.write('---\n\n')
+
+        for family, feature_list in families.items():
+            in_model = [feat for feat in feature_list if feat in selected_features]
+            if not in_model:
+                continue
+            f.write(f'## {family}\n\n')
+            for feat in in_model:
+                f.write(f'- `{feat}`\n')
+            f.write('\n')
+
+        # any selected features not covered by the families above
+        categorized = [feat for flist in families.values() for feat in flist]
+        uncategorized = [f for f in selected_features if f not in categorized]
+        if uncategorized:
+            f.write('## Other selected features\n\n')
+            for feat in uncategorized:
+                f.write(f'- `{feat}`\n')
+            f.write('\n')
+
+        f.write('---\n')
+        f.write('*Generated by src/feature_engineering.py*\n')
+
+    logger.info(f"Saved {output_path.name}")
+
+
+def run_feature_engineering(
+    parquet_path:  Path = PROCESSED_DIR / 'cleaned_loans.parquet',
+    output_dir:    Path = PROCESSED_DIR,
+    top_n:         int  = 35,
+) -> pd.DataFrame:
+
+    logger.info("Starting feature engineering pipeline")
+
+    # 1. load
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"{parquet_path} not found. Run preprocessing.py first."
+        )
+    df = pd.read_parquet(parquet_path)
+    logger.info(
+        f"Loaded {df.shape[0]:,} rows x {df.shape[1]} columns  "
+        f"({df['target'].mean():.1%} default rate)"
     )
 
-    # ── Alert summary ─────────────────────────────────────────
-    monitor.print_alert_summary()
+    # 2. encode categoricals
+    encoder    = CreditRiskEncoder()
+    df_encoded = encoder.fit_transform(df)
+    new_cols   = [c for c in df_encoded.columns if c not in df.columns]
+    logger.info(
+        f"Encoding — columns: {df.shape[1]} -> {df_encoded.shape[1]}  "
+        f"new: {new_cols}"
+    )
 
-    # ── Retraining decision ───────────────────────────────────
-    print(f'\n[DECISION] Should retrain? {monitor.should_retrain()}')
-    if monitor.should_retrain():
-        print('  Action: Schedule retraining pipeline')
+    # 3. engineer domain features
+    engineer    = CreditFeatureEngineer()
+    df_featured = engineer.fit_transform(df_encoded)
+    eng_cols    = [c for c in df_featured.columns if c not in df_encoded.columns]
+    logger.info(f"Engineered {len(eng_cols)} new features: {eng_cols}")
+    logger.info(f"Total columns after engineering: {df_featured.shape[1]}")
+
+    # 4. time-based train/test split (train <= 2015, test >= 2016)
+    #    random split would leak future patterns into past training
+    if 'issue_year' in df_featured.columns:
+        train_mask = df_featured['issue_year'] <= 2015
+        X_all      = df_featured.drop(columns=['target'])
+        y_all      = df_featured['target']
+        X_train    = X_all[train_mask]
+        X_test     = X_all[~train_mask]
+        y_train    = y_all[train_mask]
+        y_test     = y_all[~train_mask]
+        logger.info(
+            f"Time-based split — train (<=2015): {len(X_train):,}  "
+            f"test (2016+): {len(X_test):,}"
+        )
     else:
-        print('  Action: Continue monitoring. Next check in 7 days.')
+        logger.warning("issue_year not found — falling back to random 80/20 split")
+        X_all   = df_featured.drop(columns=['target'])
+        y_all   = df_featured['target']
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+        )
 
-    # ── Save drift report ─────────────────────────────────────
-    drift_path = 'outputs/drift_report.csv'
-    drift_report.to_csv(drift_path, index=False)
-    print(f'\n[SAVED] {drift_path}')
+    # keep only numeric columns, fill any remaining NaN
+    X_train = X_train.select_dtypes(include=[np.number]).fillna(X_train.median())
+    X_test  = X_test.select_dtypes(include=[np.number]).fillna(X_train.median())
 
-    print('\n' + '=' * 60)
-    print('  MONITORING COMPLETE!')
-    print('=' * 60)
+    # 5. feature selection (3-layer)
+    selector = FeatureSelector(
+        variance_threshold=0.01,
+        correlation_threshold=0.85,
+        top_n_features=top_n,
+    )
+    selector.fit(X_train, y_train)
+    selector.log_importance_table(top_n=20)
+
+    X_train_final = selector.transform(X_train)
+    X_test_final  = selector.transform(X_test)
+    logger.info(
+        f"Selected {X_train_final.shape[1]} features from {X_train.shape[1]}"
+    )
+
+    # 6. save outputs
+    df_train_out = X_train_final.copy()
+    df_train_out['target'] = y_train.values
+    df_train_out['split']  = 'train'
+
+    df_test_out = X_test_final.copy()
+    df_test_out['target'] = y_test.values
+    df_test_out['split']  = 'test'
+
+    df_model_ready = pd.concat(
+        [df_train_out, df_test_out], axis=0
+    ).reset_index(drop=True)
+
+    model_path = output_dir / 'model_ready_dataset.parquet'
+    df_model_ready.to_parquet(model_path, index=False)
+    logger.info(
+        f"Saved {model_path.name} — "
+        f"{df_model_ready.shape}  "
+        f"({df_model_ready.memory_usage(deep=True).sum()/1e6:.1f} MB)"
+    )
+
+    plot_feature_importance(
+        importance_df=selector.importance_df_,
+        output_path=OUTPUT_DIR / 'feature_importance_report.png',
+        top_n=25,
+    )
+
+    save_feature_dictionary(
+        selected_features=selector.selected_features_ + ['target'],
+        output_path=BASE_DIR / 'feature_dictionary.md',
+    )
+
+    logger.info(
+        f"Pipeline complete — "
+        f"input features: {X_all.shape[1]}, "
+        f"selected: {X_train_final.shape[1]}, "
+        f"train rows: {len(X_train_final):,}, "
+        f"test rows: {len(X_test_final):,}"
+    )
+
+    return df_model_ready
 
 
 if __name__ == '__main__':
-    run_monitoring_demo()
+    df_model = run_feature_engineering(
+        parquet_path=PROCESSED_DIR / 'cleaned_loans.parquet',
+        output_dir=PROCESSED_DIR,
+        top_n=35,
+    )
